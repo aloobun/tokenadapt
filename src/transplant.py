@@ -117,10 +117,90 @@ def main(args):
 
     old_vocab = old_tokenizer.get_vocab()
     new_vocab = new_tokenizer.get_vocab()
-    shared_vocab = list(set(new_vocab.keys()) & set(old_vocab.keys()))
-    unique_tokens = set(new_vocab.keys()) - set(shared_vocab)
-    print(f"Shared tokens: {len(shared_vocab)}")
-    print(f"Unique tokens to initialize: {len(unique_tokens)}")
+
+    decoded_lower_old_map = {}
+    print("Building map of decoded, lowercase old vocabulary...")
+    for old_token_str, old_token_id in tqdm(old_vocab.items(), desc="Decoding old vocab"):
+        try:
+            decoded_str = old_tokenizer.decode([old_token_id],
+                                            skip_special_tokens=False,
+                                            clean_up_tokenization_spaces=True).strip() # Strip whitespace to better normalize "_(spm) or Ġ(bpe)"
+
+            if decoded_str: 
+                decoded_lower = decoded_str.lower()
+                # Store the mapping. If collisions occur (e.g., "Apple" and "apple" in old vocab),
+                # this will keep the ID of the *last* one encountered. This is usually acceptable.
+                decoded_lower_old_map[decoded_lower] = old_token_id
+        except Exception as e:
+            # print(f"Warning: Could not decode old token: '{old_token_str}' (ID: {old_token_id}). Error: {e}")
+            pass 
+
+    print(f"Built map with {len(decoded_lower_old_map)} unique decoded lowercase old tokens.")
+
+    shared_tokens_map = {}  # Maps new_token_id -> old_token_id for copying
+    unique_tokens = set() 
+
+    exact_matches = 0
+    case_insensitive_matches = 0
+    decode_failures_new = 0
+
+    print("Mapping new vocabulary tokens...")
+    for new_token_str, new_token_id in tqdm(new_vocab.items(), desc="Mapping new tokens"):
+        matched = False
+        if new_token_str in old_vocab:
+            shared_tokens_map[new_token_id] = old_vocab[new_token_str]
+            exact_matches += 1
+            matched = True
+        else:
+            try:
+                decoded_new = new_tokenizer.decode([new_token_id],
+                                                skip_special_tokens=False,
+                                                clean_up_tokenization_spaces=True).strip()
+
+                if decoded_new:
+                    decoded_lower_new = decoded_new.lower()
+                    if decoded_lower_new in decoded_lower_old_map:
+                        shared_tokens_map[new_token_id] = decoded_lower_old_map[decoded_lower_new]
+                        case_insensitive_matches += 1
+                        matched = True
+
+            except Exception as e:
+                # print(f"Warning: Could not decode new token: '{new_token_str}' (ID: {new_token_id}). Error: {e}")
+                decode_failures_new += 1
+
+        if not matched:
+            unique_tokens.add(new_token_str)
+
+    total_shared = exact_matches + case_insensitive_matches
+    print(f"Token mapping complete:")
+    print(f"  - Exact raw string matches (copied): {exact_matches}")
+    print(f"  - Decoded case-insensitive matches (copied): {case_insensitive_matches}")
+    print(f"  - Total shared/copied tokens: {total_shared}")
+    print(f"  - Unique tokens needing initialization: {len(unique_tokens)}")
+    if decode_failures_new > 0:
+        print(f"  - New tokens failed to decode (treated as unique): {decode_failures_new}")
+
+
+    # --------------- Caching Embeddings -----------------
+
+    full_tokens_to_cache = []
+    print("Gathering decoded strings for unique tokens needing embeddings...")
+    for token_str in tqdm(unique_tokens, desc="Decoding unique tokens"):
+        new_token_id = new_vocab.get(token_str)
+        if new_token_id is None: continue
+        try:
+            decoded = new_tokenizer.decode([new_token_id], skip_special_tokens=False, clean_up_tokenization_spaces=True)
+            if decoded or isinstance(decoded, str):
+                full_tokens_to_cache.append(decoded)
+            # else: 
+            #     print(f"Warning: Decoding unique token '{token_str}' (ID: {new_token_id}) resulted in non-string. Skipping cache.")
+
+        except Exception as e:
+            print(f"Warning: Could not decode unique token string '{token_str}' (ID: {new_token_id}) for caching: {e}")
+            
+    full_tokens_to_cache = list(set(full_tokens_to_cache))
+
+
 
     
     embed_model_name = args.embedding_model_path.split("/")[-1]
@@ -129,27 +209,50 @@ def main(args):
     
     cache = load_cache(cache_file)
 
-    
-    full_tokens_to_cache = [new_tokenizer.decode([new_vocab[token_str]]) for token_str in unique_tokens]
-    cache = cache_embeddings(embed_model, embed_tokenizer, full_tokens_to_cache, device, 
+
+    # --------------- Full-Token Caching -----------------
+
+    print(f"Caching external embeddings for {len(full_tokens_to_cache)} unique decoded token strings...")
+    cache = cache_embeddings(embed_model, embed_tokenizer, full_tokens_to_cache, device,
                                                     cache, batch_size=args.batch_size)
-    
     full_token_embeds_cache = {token: cache[token] for token in full_tokens_to_cache if token in cache}
+    print(f"Cached embeddings obtained for {len(full_token_embeds_cache)} unique decoded strings.")
 
 
+    # --------------- Subtoken Caching -----------------
 
+    subtokens_to_cache_decoded = set()
+    print("Gathering potential old subtokens for local heuristic...")
+    for token_str in tqdm(unique_tokens, desc="Gathering potential subtokens"):
+        new_token_id = new_vocab.get(token_str)
+        if new_token_id is None: continue
+        try:
+            full_token_decoded = new_tokenizer.decode([new_token_id], skip_special_tokens=False, clean_up_tokenization_spaces=True)
+            if full_token_decoded or isinstance(full_token_decoded, str):
+                old_ids = old_tokenizer.encode(full_token_decoded, add_special_tokens=False)
+                for oid in old_ids:
+                    try:
+                        subtoken_decoded = old_tokenizer.decode([oid], skip_special_tokens=False, clean_up_tokenization_spaces=True)
+                        if subtoken_decoded or isinstance(subtoken_decoded, str):
+                            subtokens_to_cache_decoded.add(subtoken_decoded)
+                    except Exception as e:
+                        # print(f"Warning: Could not decode old subtoken ID {oid}: {e}")
+                        pass
+            # else: 
+            #     print(f"Warning: Skipping subtokens for unique token '{token_str}' as it didn't decode.")
+
+        except Exception as e:
+            print(f"Warning: Error processing unique token '{token_str}' for subtokens: {e}")
 
     
-    subtokens_to_cache = set()
-    for token_str in tqdm(unique_tokens, desc="Gathering potential subtokens"):
-        full_token_decoded = new_tokenizer.decode([new_vocab[token_str]])
-        old_ids = old_tokenizer.encode(full_token_decoded, add_special_tokens=False)
-        subtokens_to_cache.update(old_tokenizer.decode([oid]) for oid in old_ids)
-    cache = cache_embeddings(embed_model, embed_tokenizer, list(subtokens_to_cache), device, 
+    print(f"Caching external embeddings for {len(subtokens_to_cache_decoded)} potential old subtoken strings...")
+    cache = cache_embeddings(embed_model, embed_tokenizer, list(subtokens_to_cache_decoded), device,
                                                             cache, batch_size=args.batch_size)
     
-    subtoken_embeds_cache = {token: cache[token] for token in subtokens_to_cache if token in cache}
+    subtoken_embeds_cache = {token: cache[token] for token in subtokens_to_cache_decoded if token in cache}
+    print(f"Cached embeddings obtained for {len(subtoken_embeds_cache)} subtoken strings.")
 
+    # --------------- Old Vocab Caching for FAISS -----------------
 
     old_vocab_tokens_to_cache = [old_tokenizer.decode([oid]) for oid in old_vocab.values() if old_tokenizer.decode([oid]) not in cache]
     cache = cache_embeddings(embed_model, embed_tokenizer, old_vocab_tokens_to_cache, device,
@@ -207,23 +310,24 @@ def main(args):
     # --------------- Transplant Phase 2 -------------------------
 
     transplant_kwargs = {
-        "model": model,
-        "new_tokenizer": new_tokenizer,
-        "shared_vocab": shared_vocab,
-        "unique_tokens": unique_tokens,
-        "full_token_embeds_cache": full_token_embeds_cache, 
-        "subtoken_embeds_cache": subtoken_embeds_cache,  
-        "old_vocab": old_vocab,
-        "new_vocab": new_vocab,
-        "old_tokenizer": old_tokenizer,
-        "data_type": dtype,
-        "temperature": args.temperature,
-        "pad_to_multiple_of": args.multiple_of,
-        "faiss_index": faiss_index,
-        "index_to_token": index_to_token,
-        "k": args.top_k,
-        "global_weight": args.weight
-    }
+    "model": model,
+    "new_tokenizer": new_tokenizer,
+    "shared_tokens_map": shared_tokens_map, 
+    "unique_tokens": unique_tokens, 
+    "full_token_embeds_cache": full_token_embeds_cache, 
+    "subtoken_embeds_cache": subtoken_embeds_cache, 
+    "old_vocab": old_vocab, 
+    "new_vocab": new_vocab, 
+    "old_tokenizer": old_tokenizer,
+    "data_type": dtype,
+    "temperature": args.temperature,
+    "pad_to_multiple_of": args.multiple_of,
+    "faiss_index": faiss_index, 
+    "index_to_token": index_to_token, 
+    "k": args.top_k,
+    "global_weight": args.weight,
+    "threshold": args.threshold
+}
 
     print(f"Proceeding with transplantation (Is Tied :-> {tied}). global weight: {args.weight:.2f}, K: {args.top_k}")
 

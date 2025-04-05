@@ -10,14 +10,15 @@ from tqdm.auto import tqdm
 import math
 from heuristics import calculate_local_embedding, calculate_global_embedding
 import faiss 
-from typing import Optional 
+from typing import Optional , Dict, Set, List
 
 def transplant_untied_embeddings(
-    model, new_tokenizer: AutoTokenizer, shared_vocab: list, unique_tokens: set,
+    model, new_tokenizer: AutoTokenizer, shared_tokens_map: Dict[int, int], unique_tokens: set,
     full_token_embeds_cache: dict, subtoken_embeds_cache: dict, old_vocab: dict,
     new_vocab: dict, old_tokenizer: AutoTokenizer, data_type: torch.dtype,
     temperature: float, pad_to_multiple_of: int,
-    faiss_index: Optional[faiss.Index], index_to_token: Optional[dict], k: int, global_weight: float
+    faiss_index: Optional[faiss.Index], index_to_token: Optional[dict], k: int, global_weight: float,
+    threshold: float
     ) -> None:
     """
     Transplants embeddings for a model with untied input/output embeddings.
@@ -40,7 +41,7 @@ def transplant_untied_embeddings(
 
     with torch.no_grad():
         original_input_embeddings = model.get_input_embeddings().weight.clone()
-        original_output_embeddings = output_layer.weight.clone() 
+        original_output_embeddings = output_layer.weight.clone()
         embed_dim = original_input_embeddings.shape[1]
 
         new_vocab_size = len(new_tokenizer)
@@ -56,18 +57,18 @@ def transplant_untied_embeddings(
 
 
         copied_in_count, copied_out_count = 0, 0
-        for token in tqdm(shared_vocab, desc="Copying shared token embeddings (Untied)"):
-            old_id = old_vocab.get(token)
-            new_id = new_vocab.get(token)
-            if old_id is not None and new_id is not None:
-                if 0 <= old_id < original_input_embeddings.shape[0]:
-                     new_input_embeds[new_id] = original_input_embeddings[old_id].to(device='cpu', dtype=data_type)
-                     copied_in_count += 1
-                if 0 <= old_id < original_output_embeddings.shape[0]:
-                     new_output_embeds[new_id] = original_output_embeddings[old_id].to(device='cpu', dtype=data_type)
-                     copied_out_count += 1
-        print(f"Copied {copied_in_count}/{len(shared_vocab)} shared input embeddings.")
-        print(f"Copied {copied_out_count}/{len(shared_vocab)} shared output embeddings.")
+        for new_id, old_id in tqdm(shared_tokens_map.items(), desc="Copying shared token embeddings (Untied)"):
+            if not (0 <= new_id < new_input_embeds.shape[0]): continue
+            if 0 <= old_id < original_input_embeddings.shape[0]:
+                 new_input_embeds[new_id] = original_input_embeddings[old_id].to(device='cpu', dtype=data_type)
+                 copied_in_count += 1
+
+            if 0 <= old_id < original_output_embeddings.shape[0]:
+                 new_output_embeds[new_id] = original_output_embeddings[old_id].to(device='cpu', dtype=data_type)
+                 copied_out_count += 1
+
+        print(f"Copied {copied_in_count}/{len(shared_tokens_map)} shared input embeddings.")
+        print(f"Copied {copied_out_count}/{len(shared_tokens_map)} shared output embeddings.")
 
 
         local_success_in, local_success_out = 0, 0
@@ -90,27 +91,38 @@ def transplant_untied_embeddings(
 
             
             if use_local:
-                
                 e_local_in, e_local_out = calculate_local_embedding(
-                    token_str, new_id, new_tokenizer, old_tokenizer,
-                    full_token_embeds_cache, subtoken_embeds_cache,
-                    original_input_embeddings, original_output_embeddings, 
-                    calc_temperature, data_type, calc_device
+                    token_str=token_str, new_token_id=new_id,
+                    new_tokenizer=new_tokenizer, old_tokenizer=old_tokenizer,
+                    full_token_embeds_cache=full_token_embeds_cache, subtoken_embeds_cache=subtoken_embeds_cache,
+                    original_input_embeddings=original_input_embeddings,
+                    original_output_embeddings=original_output_embeddings, 
+                    temperature=calc_temperature, threshold=threshold, 
+                    data_type=data_type, device=calc_device
                 )
                 if e_local_in is not None: local_success_in += 1
                 if e_local_out is not None: local_success_out += 1 
 
             
             if use_global:
-                full_token_decoded = new_tokenizer.decode([new_id])
-                e_global_in, e_global_out = calculate_global_embedding(
-                    full_token_decoded, full_token_embeds_cache, faiss_index,old_tokenizer,
-                    index_to_token, old_vocab,
-                    original_input_embeddings, original_output_embeddings,
-                    k, calc_temperature, data_type, calc_device
-                )
-                if e_global_in is not None: global_success_in += 1
-                if e_global_out is not None: global_success_out += 1 
+                 try:
+                     full_token_decoded = new_tokenizer.decode([new_id], skip_special_tokens=False, clean_up_tokenization_spaces=True)
+                     if full_token_decoded:
+                         e_global_in, e_global_out = calculate_global_embedding(
+                             query_token_str=full_token_decoded,
+                             full_token_embeds_cache=full_token_embeds_cache, faiss_index=faiss_index,
+                             old_tokenizer=old_tokenizer, index_to_token=index_to_token, old_vocab=old_vocab,
+                             original_input_embeddings=original_input_embeddings,
+                             original_output_embeddings=original_output_embeddings,
+                             k=k, temperature=calc_temperature, threshold=threshold, 
+                             data_type=data_type, device=calc_device
+                         )
+                         if e_global_in is not None: global_success_in += 1
+                         if e_global_out is not None: global_success_out += 1
+
+                 except Exception as e:
+                     # print(f"Warning: Error during global calculation setup for '{token_str}': {e}")
+                     pass
 
             
             final_embedding_in = None
@@ -140,12 +152,12 @@ def transplant_untied_embeddings(
 
 
         print(f"Untied initialization complete for {len(unique_tokens)} unique tokens:")
-        print(f">>>  Input Embeddings:")
+        print(f">  Input Embeddings:")
         print(f"    - Local heuristic succeeded for: {local_success_in}")
         print(f"    - Global heuristic succeeded for: {global_success_in}")
         print(f"    - Combined successfully (both ran & succeeded): {combined_success_in}")
         print(f"    - Remained randomly initialized: {random_init_count_in}")
-        print(f">>>  Output Embeddings:")
+        print(f">  Output Embeddings:")
         print(f"    - Local heuristic succeeded for: {local_success_out}")
         print(f"    - Global heuristic succeeded for: {global_success_out}")
         print(f"    - Combined successfully (both ran & succeeded): {combined_success_out}")

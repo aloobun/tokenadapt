@@ -1,6 +1,5 @@
 # TokenAdapt
 
-
 TokenAdapt is a Tokenizer Transplantation Tool that allows users to seamlessly transplant tokenizers between language models while preserving semantic meaning. This tool is designed for users who want to adapt models for specific tasks or datasets without losing the integrity of the original embeddings, using intelligent 0-shot initialization heuristics.
 
 ## Installation
@@ -28,12 +27,13 @@ pip install torch transformers tqdm numpy faiss-cpu>=1.7.0
 
 ## Key Features
 
-- 🔄 **Seamless Tokenizer Transplantation**: Easily transfer tokenizers between models.
-- 🧠 **Intelligent Embedding Initialization**: Effective 0-shot initialization using a hybrid heuristic approach (local subword composition + global K-NN similarity).
-- 🔗 **Support for Tied and Untied Embeddings**: Flexibility in handling different model architectures.
-- 🚀 **Efficient Caching & Indexing**: Reduces computation time by caching external embeddings and using FAISS for efficient similarity search.
-- 🎯 **Configurable Heuristics**: Adjust temperature and heuristic weighting.
-- 🕒 **Optimized for Speed**: Batched embedding extraction and efficient indexing.
+-   🔄 **Seamless Tokenizer Transplantation**: Easily transfer tokenizers between models.
+-   💡 **Enhanced Token Matching**: Copies embeddings for tokens matching exactly *or* case-insensitively after decoding, maximizing direct transfer.
+-   🧠 **Intelligent Embedding Initialization**: Effective 0-shot initialization for remaining unique tokens using a hybrid heuristic approach (local subword composition + global K-NN similarity).
+-   🎯 **Configurable Heuristics**: Adjust temperature, heuristic weighting, K-NN neighbors, and a *similarity threshold*.
+-   🔗 **Support for Tied and Untied Embeddings**: Flexibility in handling different model architectures.
+-   🚀 **Efficient Caching & Indexing**: Reduces computation time by caching external embeddings and using FAISS for efficient similarity search.
+-   🕒 **Optimized for Speed**: Batched embedding extraction and efficient indexing.
 
 ## Quick Start
 
@@ -56,10 +56,13 @@ python src/transplant.py \
 
 ### Optional Arguments & Heuristic Control
 
--   `--embedding_model_path` (default: `nomic-ai/nomic-embed-text-v1.5`): External model used to generate embeddings for heuristic calculations (both local and global).
--   `--temperature` (default: 0.1): Controls the sharpness of the softmax weighting in heuristics (0.01-1.0). Lower values yield more distinct weights, higher values produce flatter weights.
--   `--top_k` (default: 2): Number of nearest neighbors (K) to consider for the global K-NN heuristic.
--   `--weight` (default: 0.3): Weight assigned to the global K-NN heuristic result (0.0-1.0). The local subword heuristic receives a weight of `(1 - weight)`. A weight of 0.0 disables K-NN, 1.0 disables the subword heuristic.
+-   `--embedding_model_path` (default: `nomic-ai/nomic-embed-text-v2-moe`): External model used to generate embeddings for heuristic calculations (both local and global).
+-   `--temperature` (default: 0.3): Controls the sharpness of the softmax weighting in heuristics (0.0 - 5.0). Lower values yield more distinct weights, higher values produce flatter weights.
+-   `--top_k` (default: 3): Number of nearest neighbors (K) to consider for the global heuristic.
+-   `--weight` (default: 0.3): Weight assigned to the global K-NN heuristic result (0.0 - 1.0). The local subword heuristic receives a weight of `(1 - weight)`. A weight of 0.0 disables K-NN, 1.0 disables the subword heuristic.
+-   `--threshold` (default: 0.6): Cosine similarity threshold (0.0 - 1.0).
+    *   **Global Heuristic:** Only neighbors with similarity >= threshold contribute to the weighted average.
+    *   **Local Heuristic:** The similarity component (`sim_weight`) is only considered for subtokens with similarity >= threshold.
 -   `--batch_size` (default: 16): Batch size for extracting embeddings with the external model.
 -   `--multiple_of` (default: 128): Pad vocabulary size to a multiple of this value for potential throughput improvement.
 -   `--dtype` (default: "fp32"): Data type for model loading and processing (`bf16`, `fp16`, `fp32`). Affects memory usage and computation speed.
@@ -71,7 +74,7 @@ python src/transplant.py \
 ```bash
 python src/transplant.py \
     --model_path "Qwen/Qwen2.5-3B-Instruct" \
-    --new_tokenizer_path "tinycompany/Adi-Bun-128K" \
+    --new_tokenizer_path "fhai50032/QTK-81K" \
     --new_model_name "tinycompany/Qwentify" \
     --hf_token "hf_..."
 ```
@@ -81,13 +84,14 @@ python src/transplant.py \
 ```bash
 python src/transplant.py \
     --model_path "Qwen/Qwen2.5-3B-Instruct" \
-    --new_tokenizer_path "tinycompany/Adi-Bun-128K" \
+    --new_tokenizer_path "fhai50032/QTK-81K" \
     --new_model_name "tinycompany/Qwentify" \
     --hf_token "hf_..." \
     --embedding_model_path "BAAI/bge-m3" \
     --temperature 0.24 \
-    --top_k 2 \
+    --top_k 3 \
     --weight 0.3 \
+    --threshold 0.6 \
     --batch_size 16 \
     --multiple_of 128 \
     --dtype "bf16"

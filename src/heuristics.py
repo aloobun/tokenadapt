@@ -10,7 +10,7 @@ import numpy as np
 from transformers import AutoTokenizer
 import torch.nn.functional as F
 import faiss
-from typing import Optional,Tuple
+from typing import Optional,Tuple,Dict
 
 
 def calculate_global_embedding(
@@ -24,12 +24,14 @@ def calculate_global_embedding(
     original_output_embeddings: Optional[torch.Tensor],
     k: int,
     temperature: float,
+    threshold: float,
     data_type: torch.dtype,
     device: str 
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Calculates embedding based on the Global heuristic.
 
+    Select Top-K -> Apply Threshold -> Softmax Weights -> Weighted Sum of Neighbor Embeddings
     
     Args:
         query_token_str: The string representation of the new token (decoded).
@@ -42,6 +44,7 @@ def calculate_global_embedding(
         original_output_embeddings: The output embedding matrix (if untied and exists), else None.
         k: Number of neighbors to find.
         temperature: Temperature for softmax weighting of similarities.
+        threshold: Similarity threshold for considering neighbors.
         data_type: Torch data type for calculations.
         device: Device for torch tensor operations.
 
@@ -88,10 +91,18 @@ def calculate_global_embedding(
 
 
         similarities_tensor = torch.tensor(valid_similarities, dtype=data_type, device=device)
-        weights = F.softmax(similarities_tensor / temperature, dim=0)
-        weights_unsqueezed = weights.unsqueeze(1) 
+        threshold_mask = similarities_tensor >= threshold
+        weights_input = similarities_tensor / temperature
+        weights_input = torch.where(threshold_mask, weights_input, torch.tensor(float('-inf'), device=device, dtype=data_type))
+        weights = F.softmax(weights_input, dim=0)
 
+        if torch.isinf(weights).all():
+             # print(f"Warning: All similarities below threshold {threshold} for '{query_token_str}' in global heuristic.")
+             return None, None
         
+        weights_unsqueezed = weights.unsqueeze(1)
+
+
         neighbor_input_embeds = original_input_embeddings[valid_neighbor_orig_ids].to(device=device, dtype=data_type)
         global_embedding_input = (weights_unsqueezed * neighbor_input_embeds).sum(dim=0).cpu()
 
@@ -121,11 +132,14 @@ def calculate_local_embedding(
     original_input_embeddings: torch.Tensor,
     original_output_embeddings: Optional[torch.Tensor],
     temperature: float,
+    threshold: float,
     data_type: torch.dtype,
     device: str 
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
-    Calculates embedding based on the Local Subword Composition heuristic.
+    Calculates embedding based on the Local Subword Composition heuristic,
+    applying a similarity threshold and using the combined weighting scheme:
+    (thresholded_sim_weight + avg_weight + len_weight) / temperature -> softmax
 
     Args:
         token_str: The unique token string from the new vocabulary.
@@ -137,6 +151,7 @@ def calculate_local_embedding(
         original_input_embeddings: The input embedding matrix of the original model.
         original_output_embeddings: The output embedding matrix (if untied and exists), else None.        
         temperature: Temperature for softmax weighting.
+        threshold: Similarity threshold for considering subword similarity weights.
         data_type: Torch data type for calculations.
         device: Device for torch tensor operations.
 
@@ -145,6 +160,9 @@ def calculate_local_embedding(
         - embedding_input: Calculated embedding for the input layer (CPU tensor), or None.
         - embedding_output: Calculated embedding for the output layer (CPU tensor), or None if original_output_embeddings was None or calculation failed.
     """
+    threshold = threshold * 0.70  # Generally thresold will be higher for knn ; we 70% of the threshold for subword ; 
+                                  # so if 0.7 is threshold for knn, 0.49 is threshold for subword
+
     full_token_decoded = new_tokenizer.decode([new_token_id])
 
     if full_token_decoded not in full_token_embeds_cache:
@@ -172,20 +190,31 @@ def calculate_local_embedding(
         return None, None
 
 
+    num_subtokens = len(valid_subtoken_strs)
     sub_embeds_ext_tensor = torch.stack(valid_subtoken_embeds_ext)
 
     similarities = F.cosine_similarity(full_embed_ext.unsqueeze(0), sub_embeds_ext_tensor, dim=1)
-    weights1 = F.softmax(similarities, dim=0)
+
+    threshold_mask = similarities >= threshold
+    sim_weight = similarities * threshold_mask.float()  # threshold for only sim weights
+    avg_weight = torch.ones_like(similarities) / num_subtokens
+
     try:
          len_full = len(full_token_decoded)
          if len_full == 0: raise ValueError("Zero length token")
-         len_norm = torch.tensor([len(s) / len_full for s in valid_subtoken_strs], dtype=data_type, device=device)
-    except (ValueError, ZeroDivisionError) as e:
-         print(f"Warning: Error calculating length norm for '{full_token_decoded}': {e}. Skipping length norm.")
-         len_norm = torch.zeros_like(weights1)
-    combined_weights = (weights1 + len_norm) / 2.0
-    final_weights = F.softmax(combined_weights / temperature, dim=0)
-    final_weights_unsqueezed = final_weights.unsqueeze(1) 
+         len_weight = torch.tensor([len(s) / len_full for s in valid_subtoken_strs], dtype=data_type, device=device)
+         len_weight = torch.clamp(len_weight, max=1.0) # Clamp length weight
+    except Exception:
+         len_weight = torch.zeros_like(similarities)
+    combined_score = sim_weight + avg_weight + len_weight 
+    final_weights = F.softmax(combined_score / (temperature), dim=0) 
+    if not torch.any(final_weights > 0) or torch.isnan(final_weights).any():
+        print(f"Warning: All final weights zero/NaN for '{full_token_decoded}'. Using equal weights.")
+        final_weights = torch.ones_like(similarities) / num_subtokens
+
+    final_weights_unsqueezed = final_weights.unsqueeze(1)
+
+
 
     old_embeds_orig_input = original_input_embeddings[valid_old_ids_for_input].to(device=device, dtype=data_type)
     local_embedding_input = (final_weights_unsqueezed * old_embeds_orig_input).sum(dim=0).cpu()
