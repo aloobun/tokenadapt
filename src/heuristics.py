@@ -1,17 +1,14 @@
-# coding: utf-8
-# Copyright IsNoobGrammer and aloobun, 2025
-#
-# This script contains helper functions for calculating initial embeddings
-# using local and global heuristics.
-
-
+# heuristics.py add return_details flag
 import torch
 import numpy as np
 from transformers import AutoTokenizer
 import torch.nn.functional as F
 import faiss
-from typing import Optional,Tuple,Dict
+from typing import Optional, Tuple, Dict, Any
 
+# --- Helper Function for Softmax ---
+def _softmax_with_temperature(similarities: torch.Tensor, temperature: float) -> torch.Tensor:
+    return F.softmax(similarities / temperature, dim=0)
 
 def calculate_global_embedding(
     query_token_str: str,
@@ -24,41 +21,15 @@ def calculate_global_embedding(
     original_output_embeddings: Optional[torch.Tensor],
     k: int,
     temperature: float,
-    threshold: float,
     data_type: torch.dtype,
-    device: str 
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """
-    Calculates embedding based on the Global heuristic.
+    device: str,
+    return_details: bool = False # ADDED FLAG
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Dict[str, Any]]]: # MODIFIED RETURN
 
-    Select Top-K -> Apply Threshold -> Softmax Weights -> Weighted Sum of Neighbor Embeddings
-    
-    Args:
-        query_token_str: The string representation of the new token (decoded).
-        full_token_embeds_cache: Cache mapping token strings to their external embeddings.
-        faiss_index: Pre-built FAISS index of old vocabulary external embeddings.
-        old_tokenizer: The old tokenizer.
-        index_to_token: Mapping from FAISS index ID to old vocabulary token string.
-        old_vocab: Original vocabulary mapping (token -> ID).
-        original_input_embeddings: The input embedding matrix of the original model.
-        original_output_embeddings: The output embedding matrix (if untied and exists), else None.
-        k: Number of neighbors to find.
-        temperature: Temperature for softmax weighting of similarities.
-        threshold: Similarity threshold for considering neighbors.
-        data_type: Torch data type for calculations.
-        device: Device for torch tensor operations.
-
-    Returns:
-        A tuple (embedding_input, embedding_output):
-        - embedding_input: Calculated embedding for the input layer (CPU tensor), or None.
-        - embedding_output: Calculated embedding for the output layer (CPU tensor), or None if original_output_embeddings was None or calculation failed.
-
-        
-    """
-
-    query_token_str = query_token_str
+    # ... (keep existing code for query_embedding preparation) ...
+    query_token_str = query_token_str # Ensure it's the decoded string
     if query_token_str not in full_token_embeds_cache:
-        return None, None
+        return None, None, None
 
     try:
         query_embedding_list = full_token_embeds_cache[query_token_str]
@@ -66,7 +37,11 @@ def calculate_global_embedding(
         faiss.normalize_L2(query_embedding)
     except Exception as e:
         print(f"Warning: Error preparing query vector for '{query_token_str}' in global heuristic: {e}")
-        return None, None
+        return None, None, None
+
+    details = None
+    global_embedding_input = None
+    global_embedding_output = None
 
     try:
         distances, indices = faiss_index.search(query_embedding, k)
@@ -75,6 +50,7 @@ def calculate_global_embedding(
 
         valid_neighbor_orig_ids = []
         valid_similarities = []
+        neighbor_tokens = [] # Store neighbor tokens for details
 
         for sim, idx in zip(distances, indices):
             if idx == -1: continue
@@ -85,146 +61,143 @@ def calculate_global_embedding(
             if neighbor_orig_id is not None and (0 <= neighbor_orig_id < original_input_embeddings.shape[0]):
                  valid_neighbor_orig_ids.append(neighbor_orig_id)
                  valid_similarities.append(sim)
+                 neighbor_tokens.append(neighbor_token) # Store for details
 
         if not valid_neighbor_orig_ids:
-            return None, None
-
+            return None, None, None
 
         similarities_tensor = torch.tensor(valid_similarities, dtype=data_type, device=device)
-        threshold_mask = similarities_tensor >= threshold
-        weights_input = similarities_tensor / temperature
-        weights_input = torch.where(threshold_mask, weights_input, torch.tensor(float('-inf'), device=device, dtype=data_type))
-        weights = F.softmax(weights_input, dim=0)
-
-        if torch.isinf(weights).all():
-             # print(f"Warning: All similarities below threshold {threshold} for '{query_token_str}' in global heuristic.")
-             return None, None
-        
+        weights = _softmax_with_temperature(similarities_tensor, temperature)
         weights_unsqueezed = weights.unsqueeze(1)
-
 
         neighbor_input_embeds = original_input_embeddings[valid_neighbor_orig_ids].to(device=device, dtype=data_type)
         global_embedding_input = (weights_unsqueezed * neighbor_input_embeds).sum(dim=0).cpu()
 
-        global_embedding_output = None
         if original_output_embeddings is not None:
-            neighbor_output_embeds = original_output_embeddings[valid_neighbor_orig_ids].to(device=device, dtype=data_type)
-            global_embedding_output = (weights_unsqueezed * neighbor_output_embeds).sum(dim=0).cpu()
-        else:
-            global_embedding_output = None
+            # Check if IDs are valid for output embeddings too
+            valid_indices_for_output = [i for i, oid in enumerate(valid_neighbor_orig_ids) if 0 <= oid < original_output_embeddings.shape[0]]
+            if len(valid_indices_for_output) == len(valid_neighbor_orig_ids): # Simplified check
+                 neighbor_output_embeds = original_output_embeddings[valid_neighbor_orig_ids].to(device=device, dtype=data_type)
+                 global_embedding_output = (weights_unsqueezed * neighbor_output_embeds).sum(dim=0).cpu()
+            # else: Handle case where some neighbors are not in output vocab? Or assume they are.
 
+        if return_details:
+            details = {
+                'type': 'global',
+                'contributor_ids': valid_neighbor_orig_ids,
+                'contributor_tokens': neighbor_tokens,
+                'similarities': valid_similarities,
+                'weights': weights.cpu().tolist()
+            }
 
-
-        return global_embedding_input, global_embedding_output
+        return global_embedding_input, global_embedding_output, details # MODIFIED RETURN
 
     except Exception as e:
         print(f"Warning: Error during FAISS search/processing for '{query_token_str}': {e}")
-        return None, None
+        return None, None, None
 
 
 def calculate_local_embedding(
-    token_str: str, 
+    token_str: str, # This is the raw token string from new vocab
     new_token_id: int,
     new_tokenizer: AutoTokenizer,
     old_tokenizer: AutoTokenizer,
     full_token_embeds_cache: dict,
-    subtoken_embeds_cache: dict,   
+    subtoken_embeds_cache: dict,
     original_input_embeddings: torch.Tensor,
     original_output_embeddings: Optional[torch.Tensor],
     temperature: float,
-    threshold: float,
     data_type: torch.dtype,
-    device: str 
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """
-    Calculates embedding based on the Local Subword Composition heuristic,
-    applying a similarity threshold and using the combined weighting scheme:
-    (thresholded_sim_weight + avg_weight + len_weight) / temperature -> softmax
+    device: str,
+    return_details: bool = False # ADDED FLAG
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Dict[str, Any]]]: # MODIFIED RETURN
 
-    Args:
-        token_str: The unique token string from the new vocabulary.
-        new_token_id: The ID of the token in the new vocabulary.
-        new_tokenizer: The new tokenizer.
-        old_tokenizer: The old tokenizer.
-        full_token_embeds_cache: Cache mapping decoded new token strings to external embeddings.
-        subtoken_embeds_cache: Cache mapping old subtoken strings to external embeddings.
-        original_input_embeddings: The input embedding matrix of the original model.
-        original_output_embeddings: The output embedding matrix (if untied and exists), else None.        
-        temperature: Temperature for softmax weighting.
-        threshold: Similarity threshold for considering subword similarity weights.
-        data_type: Torch data type for calculations.
-        device: Device for torch tensor operations.
+    details = None
+    local_embedding_input = None
+    local_embedding_output = None
 
-    Returns:
-        A tuple (embedding_input, embedding_output):
-        - embedding_input: Calculated embedding for the input layer (CPU tensor), or None.
-        - embedding_output: Calculated embedding for the output layer (CPU tensor), or None if original_output_embeddings was None or calculation failed.
-    """
-    threshold = threshold * 0.70  # Generally thresold will be higher for knn ; we 70% of the threshold for subword ; 
-                                  # so if 0.7 is threshold for knn, 0.49 is threshold for subword
-
-    full_token_decoded = new_tokenizer.decode([new_token_id])
+    full_token_decoded = new_tokenizer.decode([new_token_id]) # Use decoded string for cache lookup
 
     if full_token_decoded not in full_token_embeds_cache:
-        return None, None
-
-    full_embed_ext = torch.tensor(full_token_embeds_cache[full_token_decoded], dtype=data_type, device=device)
-    old_ids = old_tokenizer.encode(full_token_decoded, add_special_tokens=False)
-    if not old_ids:
-        return None, None
-
-    valid_subtoken_embeds_ext = []
-    valid_subtoken_strs = []
-    valid_old_ids_for_input = [] 
-
-
-    for oid in old_ids:
-        if 0 <= oid < original_input_embeddings.shape[0]: 
-            subtoken_str = old_tokenizer.decode([oid])
-            if subtoken_str in subtoken_embeds_cache:
-                valid_subtoken_embeds_ext.append(torch.tensor(subtoken_embeds_cache[subtoken_str], dtype=data_type, device=device))
-                valid_subtoken_strs.append(subtoken_str)
-                valid_old_ids_for_input.append(oid)
-
-    if not valid_subtoken_embeds_ext:
-        return None, None
-
-
-    num_subtokens = len(valid_subtoken_strs)
-    sub_embeds_ext_tensor = torch.stack(valid_subtoken_embeds_ext)
-
-    similarities = F.cosine_similarity(full_embed_ext.unsqueeze(0), sub_embeds_ext_tensor, dim=1)
-
-    threshold_mask = similarities >= threshold
-    sim_weight = similarities * threshold_mask.float()  # threshold for only sim weights
-    avg_weight = torch.ones_like(similarities) / num_subtokens
+        # print(f"'{full_token_decoded}' not in full_token_embeds_cache") # Debug print
+        return None, None, None
 
     try:
-         len_full = len(full_token_decoded)
-         if len_full == 0: raise ValueError("Zero length token")
-         len_weight = torch.tensor([len(s) / len_full for s in valid_subtoken_strs], dtype=data_type, device=device)
-         len_weight = torch.clamp(len_weight, max=1.0) # Clamp length weight
-    except Exception:
-         len_weight = torch.zeros_like(similarities)
-    combined_score = sim_weight + avg_weight + len_weight 
-    final_weights = F.softmax(combined_score / (temperature), dim=0) 
-    if not torch.any(final_weights > 0) or torch.isnan(final_weights).any():
-        print(f"Warning: All final weights zero/NaN for '{full_token_decoded}'. Using equal weights.")
-        final_weights = torch.ones_like(similarities) / num_subtokens
+        full_embed_ext = torch.tensor(full_token_embeds_cache[full_token_decoded], dtype=data_type, device=device)
+        old_ids = old_tokenizer.encode(full_token_decoded, add_special_tokens=False)
+        if not old_ids:
+            return None, None, None
 
-    final_weights_unsqueezed = final_weights.unsqueeze(1)
+        valid_subtoken_embeds_ext = []
+        valid_subtoken_strs = []
+        valid_old_ids_for_input = [] # Use this list for indices
+
+        for oid in old_ids:
+             # Check validity for input embeddings
+            if 0 <= oid < original_input_embeddings.shape[0]:
+                subtoken_str = old_tokenizer.decode([oid])
+                if subtoken_str in subtoken_embeds_cache:
+                    valid_subtoken_embeds_ext.append(torch.tensor(subtoken_embeds_cache[subtoken_str], dtype=data_type, device=device))
+                    valid_subtoken_strs.append(subtoken_str)
+                    valid_old_ids_for_input.append(oid) # Store the valid ID
+                # else: print(f"Subtoken '{subtoken_str}' not in cache") # Debug print
+            # else: print(f"Old ID {oid} out of bounds for input embeds") # Debug print
 
 
+        if not valid_subtoken_embeds_ext:
+            # print("No valid subtokens found.") # Debug print
+            return None, None, None
 
-    old_embeds_orig_input = original_input_embeddings[valid_old_ids_for_input].to(device=device, dtype=data_type)
-    local_embedding_input = (final_weights_unsqueezed * old_embeds_orig_input).sum(dim=0).cpu()
+        sub_embeds_ext_tensor = torch.stack(valid_subtoken_embeds_ext)
 
-    local_embedding_output = None
-    if original_output_embeddings is not None:
-        old_embeds_orig_output = original_output_embeddings[valid_old_ids_for_input].to(device=device, dtype=data_type)
-        local_embedding_output = (final_weights_unsqueezed * old_embeds_orig_output).sum(dim=0).cpu()
-    else:
-        local_embedding_output = None
+        # --- Calculate Similarities (Cosine) ---
+        # Normalize for cosine similarity calculation
+        full_embed_ext_norm = F.normalize(full_embed_ext, p=2, dim=0)
+        sub_embeds_ext_tensor_norm = F.normalize(sub_embeds_ext_tensor, p=2, dim=1)
+        similarities = torch.mv(sub_embeds_ext_tensor_norm, full_embed_ext_norm) # More efficient dot product
 
-    return local_embedding_input, local_embedding_output
+        # --- Length Normalization (Optional but in original code) ---
+        try:
+             len_full = len(full_token_decoded)
+             if len_full == 0: raise ValueError("Zero length token")
+             len_norm = torch.tensor([len(s) / len_full for s in valid_subtoken_strs], dtype=data_type, device=device)
+        except (ValueError, ZeroDivisionError) as e:
+             print(f"Warning: Error calculating length norm for '{full_token_decoded}': {e}. Skipping length norm.")
+             len_norm = torch.zeros_like(similarities) # Fallback to zeros
 
+        # --- Combine Weights ---
+        # Original code averages similarity and length norm before softmax
+        combined_scores = (similarities + len_norm) / 2.0
+        final_weights = _softmax_with_temperature(combined_scores, temperature)
+        final_weights_unsqueezed = final_weights.unsqueeze(1)
+
+        # --- Weighted Sum for Input Embeddings ---
+        old_embeds_orig_input = original_input_embeddings[valid_old_ids_for_input].to(device=device, dtype=data_type)
+        local_embedding_input = (final_weights_unsqueezed * old_embeds_orig_input).sum(dim=0).cpu()
+
+        # --- Weighted Sum for Output Embeddings (if untied) ---
+        if original_output_embeddings is not None:
+            # Check if IDs are valid for output embeddings too
+            valid_indices_for_output = [i for i, oid in enumerate(valid_old_ids_for_input) if 0 <= oid < original_output_embeddings.shape[0]]
+            if len(valid_indices_for_output) == len(valid_old_ids_for_input): # Simplified check
+                old_embeds_orig_output = original_output_embeddings[valid_old_ids_for_input].to(device=device, dtype=data_type)
+                local_embedding_output = (final_weights_unsqueezed * old_embeds_orig_output).sum(dim=0).cpu()
+            # else: Handle case?
+
+        if return_details:
+            details = {
+                'type': 'local',
+                'contributor_ids': valid_old_ids_for_input,
+                'contributor_tokens': valid_subtoken_strs,
+                'similarities': similarities.cpu().tolist(), # Raw similarities before length norm
+                'combined_scores': combined_scores.cpu().tolist(),
+                'weights': final_weights.cpu().tolist()
+            }
+
+        return local_embedding_input, local_embedding_output, details # MODIFIED RETURN
+
+    except Exception as e:
+        import traceback
+        print(f"ERROR calculating local embedding for '{token_str}' (ID: {new_token_id}, Decoded: '{full_token_decoded}'): {e}")
+        traceback.print_exc()
+        return None, None, None
